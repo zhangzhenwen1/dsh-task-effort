@@ -1,5 +1,5 @@
 {
-  "name": "task-effort",
+  "name": "dsh-task-effort",
   "version": "0.1.0",
   "type": "module",
   "main": "index.js",
@@ -14,6 +14,7 @@
   ],
   "files": [
     "index.js",
+    "lib",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -29,7 +30,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zhangzhenwen1/task-effort.git"
+    "url": "git+https://github.com/zhangzhenwen1/dsh-task-effort.git"
   },
-  "homepage": "https://github.com/zhangzhenwen1/task-effort"
+  "homepage": "https://github.com/zhangzhenwen1/dsh-task-effort"
 }

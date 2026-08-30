@@ -1,4 +1,4 @@
-# task-effort — 根据任务自动调整模型 effort
+# dsh-task-effort — 根据任务自动调整模型 effort
 
 DSH 插件：每次 LLM 调用前，根据**当前任务**自动决定模型的推理强度
 `reasoningEffort`（DeepSeek 支持 `off` / `high` / `max`），不再全局固定一个档位。
@@ -40,8 +40,8 @@ DSH 的 agent 循环在每次模型调用前会走 `agent/request` waterfall（`
 **方式一：npm / GitHub 包（推荐）**
 
 ```sh
-dsh plugin --profile web add task-effort
-# 或从 GitHub：dsh plugin --profile web add github:zhangzhenwen1/task-effort
+dsh plugin --profile web add dsh-task-effort
+# 或从 GitHub：dsh plugin --profile web add github:zhangzhenwen1/dsh-task-effort
 ```
 
 安装后重启 `dsh web`。可通过 profile 的 `cordis.patch.yml` 覆盖配置。
