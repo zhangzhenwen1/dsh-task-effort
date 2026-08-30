@@ -1,0 +1,5 @@
+# task-effort — bundle patch applied by `dsh plugin add task-effort`
+# 参照 awesome-dsh-plugin contributing.md 的 dsh.bundle 格式
+- insert:
+    - id: task-effort
+      name: task-effort
