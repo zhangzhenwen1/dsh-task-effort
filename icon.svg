@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Task effort autopilot">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#2f6f4f"/>
+  <path d="M16 40a16 16 0 1 1 32 0" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <path d="M32 40 41 28" stroke="#ffd166" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="32" cy="40" r="4" fill="#ffd166"/>
+  <path d="M16 46h32" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.75"/>
+  <path d="M22 34l2-2M32 30v-3M42 34l-2-2" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" opacity="0.6"/>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Task Effort Autopilot",
+    "description": "Adjusts reasoning effort per task with peak-period capping, countdown notices and in-turn error escalation; the decision and cost settings are editable in the Plugins panel."
+  }
+}

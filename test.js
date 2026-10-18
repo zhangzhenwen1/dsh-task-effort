@@ -1,6 +1,13 @@
 // task-effort 分类器单元测试
 // 运行：node plugins/task-effort/test.js
-import { classify, parseMarker, normalizeEffort, EFFORTS, pricingPeriod, applyPeakCap, buildNotice, nextPeriodMinutes, formatDuration } from "./index.js";
+// 注意：直接 import lib/*.js（纯逻辑，不依赖 @deepseek-ai/schemastery），
+// 单测因此可以脱离 dsh 运行环境执行；index.js 加载时需要从 dsh 安装目录
+// 解析 schemastery，只有 dsh 进程内（process.argv[1] 锚点）才拿得到。
+import { classify, parseMarker } from "./lib/classify.js";
+import { normalizeEffort, EFFORTS } from "./lib/effort.js";
+import { pricingPeriod, applyPeakCap, nextPeriodMinutes, formatDuration } from "./lib/period.js";
+import { buildNotice } from "./lib/notice.js";
+import { latestUserMessage, providerApplicable, turnHasErrors } from "./lib/session.js";
 
 let failed = 0;
 function check(label, actual, expected) {
@@ -107,6 +114,52 @@ check("周日 15:00 → 距周一 09:00 高峰 1080 分钟", nextPeriodMinutes(b
 check("format 45 分钟", formatDuration(45), "45 分钟");
 check("format 60 分钟", formatDuration(60), "1 小时");
 check("format 85 分钟", formatDuration(85), "1 小时 25 分钟");
+
+// 会话格式 v4 兼容：0.2 起 source.kind 禁止 "plugin"，必须使用 producer-owned kind
+check("notice source kind 兼容 v4", buildNotice({ effort: "high", reason: "test" }).source.kind, "plugin:task-effort");
+check("notice source 不再携带 plugin 字段", Object.hasOwn(buildNotice({ effort: "high", reason: "test" }).source, "plugin"), false);
+
+// 注入消息排除：0.2 的 producer-owned kind "plugin:*" 不能被当成真实用户消息
+check("latestUserMessage 排除 plugin:* 注入", latestUserMessage([
+	{ id: "u1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "真实任务" }] },
+	{ id: "p1", role: "user", source: { kind: "plugin:qmd-autosearch" }, content: [{ type: "text", text: "检索补充" }] }
+]), { id: "u1", text: "真实任务" });
+check("latestUserMessage 排除旧式 plugin 注入", latestUserMessage([
+	{ id: "p0", role: "user", source: { kind: "plugin", plugin: "x" }, content: [{ type: "text", text: "旧注入" }] }
+]), null);
+
+// provider 白名单判定：决定插件是否真的会改写请求（也决定要不要发档位通知）
+check("provider 在白名单→生效", providerApplicable("deepseek-account", ["deepseek-official", "deepseek-account"]), true);
+check("provider 不在白名单→不生效", providerApplicable("qwen-token-plan-cn", ["deepseek-official", "deepseek-account"]), false);
+check("provider 未知→乐观放行", providerApplicable(void 0, ["deepseek-official"]), true);
+check("白名单缺失→乐观放行", providerApplicable("deepseek-account", void 0), true);
+
+// 轮内出错升级：0.2 的 Session 用 snapshotEvents()，tool/result 的失败标记在 message.isError，
+// 非零退出码只出现在 text 里（isError=false）
+const sessionOf = (events) => ({ session: { snapshotEvents: () => events } });
+check("turnHasErrors: 0.2 message.isError", turnHasErrors(sessionOf([
+	{ type: "turn/start", data: { turn: 2 } },
+	{ type: "tool/result", data: { turn: 2, message: { isError: true, content: [{ type: "text", text: "boom" }] } } }
+]), 2), true);
+check("turnHasErrors: 0.2 非零退出码文本", turnHasErrors(sessionOf([
+	{ type: "turn/start", data: { turn: 2 } },
+	{ type: "tool/result", data: { turn: 2, message: { isError: false, content: [{ type: "text", text: "Error: boom\n[exit code: 1]" }] } } }
+]), 2), true);
+check("turnHasErrors: 正常输出不升级", turnHasErrors(sessionOf([
+	{ type: "turn/start", data: { turn: 2 } },
+	{ type: "tool/result", data: { turn: 2, message: { isError: false, content: [{ type: "text", text: "all good" }] } } }
+]), 2), false);
+check("turnHasErrors: 上个 turn 的错误不算", turnHasErrors(sessionOf([
+	{ type: "turn/start", data: { turn: 1 } },
+	{ type: "tool/result", data: { turn: 1, message: { isError: true, content: [] } } },
+	{ type: "turn/start", data: { turn: 2 } },
+	{ type: "tool/result", data: { turn: 2, message: { isError: false, content: [{ type: "text", text: "ok" }] } } }
+]), 2), false);
+check("turnHasErrors: 0.1 events 数组兼容", turnHasErrors({ session: { events: [
+	{ type: "turn/start", data: { turn: 2 } },
+	{ type: "tool/result", data: { turn: 2, message: { content: [{ type: "tool-result", isError: true, content: [] }] } } }
+] } }, 2), true);
+check("turnHasErrors: 无 session", turnHasErrors({}, 2), false);
 
 if (failed > 0) {
 	console.log(`\n${failed} 项失败`);

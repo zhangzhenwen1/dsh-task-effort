@@ -17,36 +17,110 @@
 // - 只影响配置的 provider 白名单（默认 deepseek-official），且会按模型
 //   实际支持的 effort 列表收敛，不会把不支持的 effort 强加给其他模型
 // - GUI 手动选择档位后插件自动尊重（手动优先），重启/新会话恢复自动
-import { appendFileSync } from "node:fs";
+import { appendFileSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DEFAULTS, classify } from "./lib/classify.js";
 import { normalizeEffort, EFFORTS } from "./lib/effort.js";
 import { pricingPeriod, applyPeakCap, nextPeriodMinutes } from "./lib/period.js";
 import { buildNotice } from "./lib/notice.js";
-import { latestUserMessage, turnHasErrors } from "./lib/session.js";
+import { latestUserMessage, turnHasErrors, providerApplicable } from "./lib/session.js";
 
 export const name = "task-effort";
+
+// 本地插件（绝对路径 / link: 安装）无法用裸包名解析 harness 包；以正在运行的
+// dsh 入口（process.argv[1]）为锚点解析 @deepseek-ai/*，随 dsh 升级自动跟随。
+const dshRequire = (() => {
+	try {
+		return createRequire(realpathSync(process.argv[1]));
+	} catch {
+		return createRequire(import.meta.url);
+	}
+})();
+
+async function loadSchemastery() {
+	try {
+		const manifest = dshRequire.resolve("@deepseek-ai/schemastery/package.json");
+		const esm = join(dirname(manifest), "lib/index.mjs");
+		return (await import(pathToFileURL(esm).href)).default;
+	} catch (error) {
+		throw new Error(`task-effort: 无法从 dsh 安装目录加载 @deepseek-ai/schemastery（${error.message}）`);
+	}
+}
+
+const z = await loadSchemastery();
+
+/** 读取可能被 Cordis 包成 volatile 引用的配置值。 */
+const readVolatile = (value) =>
+	value !== null && typeof value === "object" && typeof value.get === "function" ? value.get() : value;
+
+/** 可空字符串（periodOverride / debugFile 之类允许显式 null 的字段）。 */
+const nullableString = () => z.union([z.string(), z.const(null)]);
+
+/**
+ * 插件配置。带 volatile 的字段可在插件面板「配置」表单里可视化编辑并即时生效；
+ * 关键词表等高级字段保持 patch 配置（非 volatile，不进表单）。
+ */
+export const Config = z.object({
+	// 总开关与作用范围
+	enabled: z.boolean().default(true).volatile(),
+	// 0.2 起 DeepSeek 有两个 provider：API Key 的 deepseek-official 与账号登录的
+	// deepseek-account；两者的模型能力与 effort 列表一致，默认都纳入白名单。
+	providers: z.array(String).default(["deepseek-official", "deepseek-account"]).volatile(),
+	// 判定
+	defaultEffort: z.string().default("high").volatile(),
+	escalateOnError: z.boolean().default(true).volatile(),
+	longThreshold: z.number().default(200).volatile(),
+	shortThreshold: z.number().default(4).volatile(),
+	// 成本 / 时段
+	costAware: z.boolean().default(true).volatile(),
+	peakCap: z.string().default("high").volatile(),
+	periodOverride: nullableString().default(null).volatile(),
+	// 子代理与可观测性
+	subagents: z.string().default("auto").volatile(),
+	notify: z.boolean().default(true).volatile(),
+	log: z.boolean().default(true).volatile(),
+	// 触发档位的关键词表（可视化编辑；清空 = 恢复内置默认）
+	maxKeywords: z.array(String).default(DEFAULTS.maxKeywords).volatile(),
+	offKeywords: z.array(String).default(DEFAULTS.offKeywords).volatile(),
+	politenessPrefixes: z.array(String).default(DEFAULTS.politenessPrefixes).volatile(),
+	continuationKeywords: z.array(String).default(DEFAULTS.continuationKeywords).volatile(),
+	// 调试开关（仅 patch 配置，不进可视化表单）
+	debugFile: nullableString()
+});
 
 // 保持对旧入口的导出兼容（test.js / 外部工具可直接从 index.js import）
 export { DEFAULTS, classify, parseMarker } from "./lib/classify.js";
 export { EFFORTS, normalizeEffort } from "./lib/effort.js";
 export { PERIOD_LABELS, pricingPeriod, applyPeakCap, nextPeriodMinutes, formatDuration } from "./lib/period.js";
 export { buildNotice } from "./lib/notice.js";
-export { latestUserMessage, turnHasErrors } from "./lib/session.js";
+export { latestUserMessage, turnHasErrors, providerApplicable } from "./lib/session.js";
 
 // ── 插件主体 ────────────────────────────────────────────────────────
 export function apply(ctx, config = {}) {
-	const cfg = { ...DEFAULTS, ...config };
-	cfg.maxKeywords = cfg.maxKeywords ?? DEFAULTS.maxKeywords;
-	cfg.offKeywords = cfg.offKeywords ?? DEFAULTS.offKeywords;
-	cfg.politenessPrefixes = cfg.politenessPrefixes ?? DEFAULTS.politenessPrefixes;
-	cfg.continuationKeywords = cfg.continuationKeywords ?? DEFAULTS.continuationKeywords;
-	const defaultEffort = normalizeEffort(cfg.defaultEffort) ?? "high";
-	cfg.defaultEffort = defaultEffort;
-	if (!cfg.enabled) return;
+	// 每次判定前重建一份纯值配置：volatile 字段读引用 → 面板改完即时生效。
+	const snapshot = () => {
+		const plain = {};
+		for (const [key, value] of Object.entries(config ?? {})) plain[key] = readVolatile(value);
+		const cfg = { ...DEFAULTS, ...plain };
+		cfg.maxKeywords = cfg.maxKeywords ?? DEFAULTS.maxKeywords;
+		cfg.offKeywords = cfg.offKeywords ?? DEFAULTS.offKeywords;
+		cfg.politenessPrefixes = cfg.politenessPrefixes ?? DEFAULTS.politenessPrefixes;
+		cfg.continuationKeywords = cfg.continuationKeywords ?? DEFAULTS.continuationKeywords;
+		cfg.defaultEffort = normalizeEffort(cfg.defaultEffort) ?? "high";
+		// "none" / 空串 = 关闭高峰限档（null 语义，patch 里写 null 也兼容）
+		cfg.peakCap = cfg.peakCap === "none" || cfg.peakCap === "" || cfg.peakCap === null ? null : cfg.peakCap;
+		// 空串 = 按真实时钟（等价 null）
+		cfg.periodOverride = cfg.periodOverride === "" || cfg.periodOverride === void 0 ? null : cfg.periodOverride;
+		return cfg;
+	};
 
-	const debug = cfg.debugFile ? (line) => {
+	const startupCfg = snapshot();
+	// 调试文件路径只在启动时读取（非 volatile；改动需重启，属于调试开关）
+	const debug = startupCfg.debugFile ? (line) => {
 		try {
-			appendFileSync(cfg.debugFile, `[${new Date().toISOString()}] ${line}\n`);
+			appendFileSync(startupCfg.debugFile, `[${new Date().toISOString()}] ${line}\n`);
 		} catch {
 			/* 调试日志失败不影响插件 */
 		}
@@ -112,11 +186,27 @@ export function apply(ctx, config = {}) {
 		return null;
 	}
 
-	const isApplicable = (agent, provider) => {
+	const isApplicable = (agent, provider, cfg) => {
 		if (!cfg.providers.includes(provider)) return false;
 		if (cfg.subagents === "off" && agent.options?.subagentDepth !== undefined) return false;
 		return true;
 	};
+
+	/** 尽力判断当前 agent 实际会走哪个 provider：优先最近一次请求头，其次默认模型选择。 */
+	function knownProvider(agent) {
+		try {
+			const header = agent?.session?.requestHeader?.();
+			if (typeof header?.config?.provider === "string") return header.config.provider;
+			const fallback = ctx.get("agentDefaultModel")?.currentSelection?.();
+			if (typeof fallback?.provider === "string") return fallback.provider;
+		} catch {
+			/* 查询失败按“未知”处理，仍发送通知 */
+		}
+		return void 0;
+	}
+
+	/** provider 是否在本插件的生效白名单内（未知时乐观放行，避免漏发通知）。 */
+	const isApplicableProvider = (agent, cfg) => providerApplicable(knownProvider(agent), cfg.providers);
 
 	// agent/pre-step：每步执行前判定/沿用/升级 effort，并可选注入说明。
 	// prepend 保证在 qmd-autosearch 等插件之前拿到原始 claimed 消息。
@@ -129,6 +219,9 @@ export function apply(ctx, config = {}) {
 		debug?.(`pre-step: agent=${agent?.id} turn=${turn} step=${step} claimed=${Array.isArray(messages) ? messages.length : "?"} kinds=${Array.isArray(messages) ? messages.map((m) => `${m?.role}:${m?.source?.kind}`).join(",") : "?"}`);
 		const decision = await next();
 		if (agent === void 0 || !Array.isArray(messages)) return decision;
+		// 每步读取最新配置（面板改动即时生效；总开关关闭时原样放行）
+		const cfg = snapshot();
+		if (!cfg.enabled) return decision;
 		const previous = decisions.get(agent);
 		const user = latestUserMessage(messages);
 		let current = previous;
@@ -163,8 +256,9 @@ export function apply(ctx, config = {}) {
 			if (cfg.log) ctx.logger.info("task-effort: agent=%s turn=%d effort=max reason=escalate:tool-error", agent.id, turn);
 		}
 
-		// 注入说明：effort 相对上一轮发生了变化时才提醒
-		if (cfg.notify && current && current.effort !== previous?.effort &&
+		// 注入说明：effort 相对上一轮发生了变化、且该 provider 确实会生效时才提醒
+		// （provider 不在白名单时插件不会改写请求，此时发通知会与实际档位不一致）
+		if (cfg.notify && isApplicableProvider(agent, cfg) && current && current.effort !== previous?.effort &&
 				decision.kind !== "reject" && Array.isArray(decision.messages)) {
 			const reminder = buildNotice(current, period, remainingMinutes);
 			const lastClaimedIndex = decision.messages.findLastIndex((message) => messages.includes(message));
@@ -186,6 +280,8 @@ export function apply(ctx, config = {}) {
 		const base = await next();
 		debug?.(`request: agent=${agent?.id} base.effort=${base?.reasoningEffort} base.provider=${base?.provider} base.model=${base?.model}`);
 		if (agent === void 0 || typeof base !== "object" || base === null) return base;
+		const cfg = snapshot();
+		if (!cfg.enabled) return base;
 		const decided = decisions.get(agent);
 		const auto = lastAutoApplied.get(agent);
 		const manual = manualMode.get(agent) === true;
@@ -208,7 +304,7 @@ export function apply(ctx, config = {}) {
 		}
 
 		if (!decided) return base;
-		if (!isApplicable(agent, base.provider)) return base;
+		if (!isApplicable(agent, base.provider, cfg)) return base;
 		const capabilities = await modelEfforts(base.provider, base.model, signal);
 		debug?.(`request: decided=${decided.effort} (${decided.reason}) capabilities=${JSON.stringify(capabilities)}`);
 		// 能力查询失败时兜底：allowlist 已限定 provider，直接应用判定（prepareCall 仍会校验）
