@@ -7,7 +7,7 @@ import { classify, parseMarker } from "./lib/classify.js";
 import { normalizeEffort, EFFORTS } from "./lib/effort.js";
 import { pricingPeriod, applyPeakCap, nextPeriodMinutes, formatDuration } from "./lib/period.js";
 import { buildNotice } from "./lib/notice.js";
-import { latestUserMessage, providerApplicable, turnHasErrors } from "./lib/session.js";
+import { latestUserMessage, providerApplicable, turnHasErrors, toolResultFailed } from "./lib/session.js";
 
 let failed = 0;
 function check(label, actual, expected) {
@@ -160,6 +160,22 @@ check("turnHasErrors: 0.1 events 数组兼容", turnHasErrors({ session: { event
 	{ type: "tool/result", data: { turn: 2, message: { content: [{ type: "tool-result", isError: true, content: [] }] } } }
 ] } }, 2), true);
 check("turnHasErrors: 无 session", turnHasErrors({}, 2), false);
+
+// 失败判定只认权威信号：成功结果的正文里出现「失败/错误/error」不能误报
+// （2026-11-09 实测：grep 知识库的成功结果命中这些词，插件误升级 max）
+check("toolResultFailed: 成功正文含失败词不误报", toolResultFailed({
+	isError: false,
+	content: [{ type: "text", text: "Line 64: 互换失败；\nLine 57: **直觉认知（错误）**：加息=收紧\nError: not really" }]
+}), false);
+check("toolResultFailed: 非零退出码标记", toolResultFailed({
+	isError: false,
+	content: [{ type: "text", text: "boom\n[exit code: 1]" }]
+}), true);
+check("toolResultFailed: exit code: 0 不算失败", toolResultFailed({
+	isError: false,
+	content: [{ type: "text", text: "ok\n[exit code: 0]" }]
+}), false);
+check("toolResultFailed: error 元数据", toolResultFailed({ isError: true, content: [] }), true);
 
 if (failed > 0) {
 	console.log(`\n${failed} 项失败`);

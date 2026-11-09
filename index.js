@@ -1,10 +1,15 @@
 // task-effort — 根据任务自动调整模型 reasoning effort 的插件
 //
-// 原理：DSH 每次 LLM 调用前都会走 `agent/request` waterfall（见
-// dsh-agent-loop 的 buildRequest），插件可以在其中改写 `reasoningEffort`
-//（DeepSeek 支持 off / low / high / max）。插件在 `agent/pre-step` 时读取
-// 本轮最新用户消息，用启发式规则判定任务难度，把决定存起来，随后在
-// `agent/request` 中应用到该步的请求配置上。
+// 原理：DSH 在 `agent/pre-step` 时确定本步的 model selection，再进入
+// `agent/request`。0.2.1 及更早可以在 `agent/request` 里改写
+// `reasoningEffort`（DeepSeek 支持 off / low / high / max）；0.2.2 起该
+// 改写会被 agent loop 拒绝（"proposed reasoning effort ... after step
+// preparation fixed ..."），必须在步准备读取选择之前调用
+// `agent.model.select()`。因此本插件双轨：
+//   - 新版（agent.model.select 存在）：在 `agent/inbox/claimed`（claim 发生在
+//     pre-step 读取 selection 之前）判定并写 model/selection；
+//   - 旧版：仍在 `agent/pre-step` 判定、`agent/request` 应用。
+// 两条路径共用同一套判定/限档/通知逻辑。
 //
 // 特性：
 // - 每轮（每个新用户消息）重新判定：简单闲聊 → off，普通任务 → high，
@@ -25,7 +30,7 @@ import { DEFAULTS, classify } from "./lib/classify.js";
 import { normalizeEffort, EFFORTS } from "./lib/effort.js";
 import { pricingPeriod, applyPeakCap, nextPeriodMinutes } from "./lib/period.js";
 import { buildNotice } from "./lib/notice.js";
-import { latestUserMessage, turnHasErrors, providerApplicable } from "./lib/session.js";
+import { latestUserMessage, turnHasErrors, providerApplicable, toolResultFailed } from "./lib/session.js";
 
 export const name = "task-effort";
 
@@ -95,7 +100,7 @@ export { DEFAULTS, classify, parseMarker } from "./lib/classify.js";
 export { EFFORTS, normalizeEffort } from "./lib/effort.js";
 export { PERIOD_LABELS, pricingPeriod, applyPeakCap, nextPeriodMinutes, formatDuration } from "./lib/period.js";
 export { buildNotice } from "./lib/notice.js";
-export { latestUserMessage, turnHasErrors, providerApplicable } from "./lib/session.js";
+export { latestUserMessage, turnHasErrors, providerApplicable, toolResultFailed } from "./lib/session.js";
 
 // ── 插件主体 ────────────────────────────────────────────────────────
 export function apply(ctx, config = {}) {
@@ -137,6 +142,8 @@ export function apply(ctx, config = {}) {
 	const pendingUiRefresh = new Set();
 	/** registration → Map(model → { efforts, defaultEffort })：能力缓存，按适配器实例隔离 */
 	const capabilityCache = new WeakMap();
+	/** agent → 待注入的档位通知（新版在 claim 时判定，pre-step 统一插入） */
+	const noticePending = new WeakMap();
 
 	async function modelEfforts(provider, model, signal) {
 		// 注意：cordis 中服务不能直接 ctx.llm 访问，必须 ctx.get("llm")
@@ -186,6 +193,84 @@ export function apply(ctx, config = {}) {
 		return null;
 	}
 
+	/** 新版 Agent 暴露 model.select()：改档必须落在步准备读取 selection 之前。 */
+	const canSelectEffort = (agent) => typeof agent?.model?.select === "function";
+
+	/** 同步读已缓存的能力；未缓存返回 null（由 clampFor 决定是否信任白名单）。 */
+	function cachedCapabilities(provider, model) {
+		try {
+			const registration = ctx.get("llm")?.registration?.(provider);
+			if (!registration) return null;
+			return capabilityCache.get(registration)?.get(model) ?? null;
+		} catch {
+			return null;
+		}
+	}
+
+	/** 按已缓存能力收敛；没有缓存时信任 provider 白名单（DeepSeek 全档位支持）。 */
+	function clampFor(provider, model, effort) {
+		const capabilities = cachedCapabilities(provider, model);
+		if (capabilities === null) return effort;
+		return clamp(effort, capabilities);
+	}
+
+	/** 统一判定：classify + 高峰限档，写入 decisions，返回本次判定与上一轮 effort。 */
+	function recordDecision(agent, user, turn, cfg, period) {
+		const previous = decisions.get(agent);
+		const judged = classify(user.text, previous, cfg);
+		let effort = judged.effort;
+		let reason = judged.reason;
+		if (cfg.costAware) {
+			const capped = applyPeakCap(effort, period, cfg.peakCap);
+			if (capped !== effort) {
+				effort = capped;
+				reason = `${reason}+peak-cap`;
+			}
+		}
+		const current = { messageId: user.id, turn, effort, reason };
+		decisions.set(agent, current);
+		debug?.(`decision: 判定 → effort=${effort} reason=${reason} text=${JSON.stringify(user.text)} period=${period}`);
+		if (cfg.log) {
+			ctx.logger.info(
+				"task-effort: agent=%s turn=%d effort=%s reason=%s period=%s",
+				agent.id, turn, effort, reason, period
+			);
+		}
+		return { current, previousEffort: previous?.effort };
+	}
+
+	/**
+	 * 新版：把判定写进 model/selection。返回实际生效的判定（含能力收敛），
+	 * 无法选择（无 selection / provider 不在白名单 / 手动模式）时返回 null。
+	 */
+	function selectEffort(agent, decision, cfg) {
+		if (!canSelectEffort(agent) || manualMode.get(agent) === true) return null;
+		let current;
+		try {
+			current = agent.model.current();
+		} catch {
+			return null;
+		}
+		if (current === void 0 || typeof current.provider !== "string" || typeof current.model !== "string") return null;
+		if (!isApplicable(agent, current.provider, cfg)) return null;
+		const effort = clampFor(current.provider, current.model, decision.effort);
+		if (!effort) return null;
+		let changed = false;
+		if (current.reasoningEffort !== effort) {
+			try {
+				agent.model.select({ provider: current.provider, model: current.model, reasoningEffort: effort });
+				changed = true;
+			} catch (error) {
+				debug?.(`claim: model.select 失败: ${error?.message ?? error}`);
+				return null;
+			}
+		}
+		lastAutoApplied.set(agent, effort);
+		if (changed) pendingUiRefresh.add(agent);
+		debug?.(`claim: 应用 effort=${effort}（model.select）`);
+		return { ...decision, effort };
+	}
+
 	const isApplicable = (agent, provider, cfg) => {
 		if (!cfg.providers.includes(provider)) return false;
 		if (cfg.subagents === "off" && agent.options?.subagentDepth !== undefined) return false;
@@ -208,8 +293,51 @@ export function apply(ctx, config = {}) {
 	/** provider 是否在本插件的生效白名单内（未知时乐观放行，避免漏发通知）。 */
 	const isApplicableProvider = (agent, cfg) => providerApplicable(knownProvider(agent), cfg.providers);
 
-	// agent/pre-step：每步执行前判定/沿用/升级 effort，并可选注入说明。
+	// agent/inbox/claimed：claim 发生在 pre-step 读取 model selection 之前，
+	// 是 0.2.2+ 唯一能让本步请求生效的改档时机。
+	ctx.on("agent/inbox/claimed", ({ agent, message, turn }) => {
+		if (agent === void 0 || !canSelectEffort(agent) || manualMode.get(agent) === true) return;
+		const user = latestUserMessage([message]);
+		if (!user) return;
+		const cfg = snapshot();
+		if (!cfg.enabled) return;
+		if (decisions.get(agent)?.messageId === user.id) return;
+		const period = cfg.periodOverride ?? pricingPeriod();
+		const { current, previousEffort } = recordDecision(agent, user, turn, cfg, period);
+		const applied = selectEffort(agent, current, cfg);
+		if (applied !== null && cfg.notify && isApplicableProvider(agent, cfg) && applied.effort !== previousEffort) {
+			noticePending.set(agent, applied);
+		}
+	});
+
+	// agent/tools/result：新版在工具报错后立即把下一步升到 max。必须在本步内
+	// 同步落盘 model/selection，下一步 claim 后 model.current() 才会读到 max。
+	ctx.on("tools/result", (exec, result) => {
+		const agent = exec?.agent;
+		if (agent === void 0 || !canSelectEffort(agent) || manualMode.get(agent) === true) return;
+		if (exec.parent !== void 0) return; // 只处理顶层调用
+		const cfg = snapshot();
+		if (!cfg.enabled || !cfg.escalateOnError) return;
+		if (!toolResultFailed(result)) return;
+		let selection;
+		try {
+			selection = agent.model.current();
+		} catch {
+			return;
+		}
+		if (!isApplicable(agent, selection?.provider, cfg)) return;
+		const previous = decisions.get(agent);
+		const current = { messageId: previous?.messageId, turn: previous?.turn, effort: "max", reason: "escalate:tool-error" };
+		decisions.set(agent, current);
+		debug?.(`decision: 判定 → effort=max reason=escalate:tool-error`);
+		if (cfg.log) ctx.logger.info("task-effort: agent=%s effort=max reason=escalate:tool-error", agent.id);
+		selectEffort(agent, current, cfg);
+	});
+
+	// agent/pre-step：每步执行前确定判定、处理轮内升级、注入说明。
 	// prepend 保证在 qmd-autosearch 等插件之前拿到原始 claimed 消息。
+	// 新版（0.2.2+）的档位在 claim 时已写入 model/selection，这里只补通知与
+	// 兜底判定；旧版仍在这里判定，交给 agent/request 应用。
 	ctx.on("agent/pre-step", async ({ agent, messages, turn, step, signal }, next) => {
 		// 上一步已应用 effort 变更且 header 已落库 → 通知客户端刷新（模型选择器显示实际档位）
 		if (agent !== void 0 && pendingUiRefresh.delete(agent)) {
@@ -222,33 +350,42 @@ export function apply(ctx, config = {}) {
 		// 每步读取最新配置（面板改动即时生效；总开关关闭时原样放行）
 		const cfg = snapshot();
 		if (!cfg.enabled) return decision;
-		const previous = decisions.get(agent);
-		const user = latestUserMessage(messages);
-		let current = previous;
 		const period = cfg.periodOverride ?? pricingPeriod();
 		const remainingMinutes = cfg.periodOverride ? null : nextPeriodMinutes();
 
-		// 有新的真实用户消息 → 重新判定（覆盖新任务/中途转向）
-		if (user && user.id !== previous?.messageId) {
-			const judged = classify(user.text, previous, cfg);
-			let effort = judged.effort;
-			let reason = judged.reason;
-			if (cfg.costAware) {
-				const capped = applyPeakCap(effort, period, cfg.peakCap);
-				if (capped !== effort) {
-					effort = capped;
-					reason = `${reason}+peak-cap`;
+		if (canSelectEffort(agent)) {
+			// 新版：claim 已判定并写 selection；没有判定时（无 claimed 事件）只补判定，
+			// 此时再改档已经来不及，等下一步或下一轮生效。
+			if (!decisions.get(agent)) {
+				const user = latestUserMessage(messages);
+				if (user) {
+					const { current, previousEffort } = recordDecision(agent, user, turn, cfg, period);
+					if (cfg.notify && isApplicableProvider(agent, cfg) && current.effort !== previousEffort) {
+						noticePending.set(agent, current);
+					}
 				}
 			}
-			current = { messageId: user.id, turn, effort, reason };
-			decisions.set(agent, current);
-			debug?.(`pre-step: 判定 → effort=${effort} reason=${reason} text=${JSON.stringify(user.text)} period=${period}`);
-			if (cfg.log) {
-				ctx.logger.info(
-					"task-effort: agent=%s turn=%d effort=%s reason=%s period=%s",
-					agent.id, turn, effort, reason, period
-				);
+			const notice = noticePending.get(agent);
+			noticePending.delete(agent);
+			if (notice && cfg.notify && decision.kind !== "reject" && Array.isArray(decision.messages)) {
+				const reminder = buildNotice(notice, period, remainingMinutes);
+				const lastClaimedIndex = decision.messages.findLastIndex((message) => messages.includes(message));
+				return {
+					...decision,
+					messages: decision.messages.toSpliced(lastClaimedIndex + 1, 0, reminder)
+				};
 			}
+			return decision;
+		}
+
+		// 旧版：判定在这里发生，由 agent/request 应用到请求配置
+		const previous = decisions.get(agent);
+		const user = latestUserMessage(messages);
+		let current = previous;
+
+		// 有新的真实用户消息 → 重新判定（覆盖新任务/中途转向）
+		if (user && user.id !== previous?.messageId) {
+			current = recordDecision(agent, user, turn, cfg, period).current;
 		} else if (current && cfg.escalateOnError && turnHasErrors(agent, turn) && current.effort !== "max") {
 			// 本轮工具已报错 → 剩余步骤升级到 max（应急纠错不受高峰限档约束）
 			current = { ...current, effort: "max", reason: "escalate:tool-error" };
@@ -270,7 +407,9 @@ export function apply(ctx, config = {}) {
 		return decision;
 	}, { prepend: true });
 
-	// agent/request：把判定结果应用到本次请求的 reasoningEffort。
+	// agent/request：旧版把判定结果应用到本次请求的 reasoningEffort；
+	// 新版（0.2.2+）的选择已在 claim/工具报错时落盘，这里绝不能再改，
+	// 否则 agent loop 会以 "after step preparation fixed" 终止整轮。
 	// prepend 保证本插件的改写是 waterfall 最外层（最终生效）。
 	// 手动选择检测：GUI 手动选档位后，selectionFor 的 picked 优先于 logged
 	// header，base 的 effort 会偏离插件上次自动应用的值 → 进入 manualMode，
@@ -285,6 +424,29 @@ export function apply(ctx, config = {}) {
 		const decided = decisions.get(agent);
 		const auto = lastAutoApplied.get(agent);
 		const manual = manualMode.get(agent) === true;
+
+		if (canSelectEffort(agent)) {
+			if (manual) {
+				// 手动模式：base 回到插件上次自动值 → 用户已选回 Provider default，恢复自动
+				if (base.reasoningEffort === auto) {
+					debug?.(`request: 手动选择已清除（base=${base.reasoningEffort} 回到自动值），恢复自动模式`);
+					manualMode.delete(agent);
+				} else {
+					debug?.(`request: 手动模式，尊重 GUI 选择 effort=${base.reasoningEffort}`);
+				}
+				return base;
+			}
+			if (decided && auto !== void 0 && base.reasoningEffort !== auto) {
+				// 非手动模式但 base 偏离自动值 → GUI 手动选择了档位
+				debug?.(`request: 检测到 GUI 手动选择 effort=${base.reasoningEffort}（自动值=${auto}），进入手动模式`);
+				manualMode.set(agent, true);
+				decisions.delete(agent);
+				return base;
+			}
+			// 机会式预热能力缓存，供下一轮在 claim 阶段同步收敛档位
+			if (decided) void modelEfforts(base.provider, base.model, signal);
+			return base;
+		}
 
 		if (manual) {
 			// 手动模式：base 回到插件上次自动值 → 用户已选回 Provider default，恢复自动

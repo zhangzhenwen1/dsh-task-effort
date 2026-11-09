@@ -5,13 +5,20 @@ DSH 插件：每次 LLM 调用前，根据**当前任务**自动决定模型的�
 
 ## 工作原理
 
-DSH 的 agent 循环在每次模型调用前会走 `agent/request` waterfall（`dsh-agent-loop`
-的 `buildRequest`），插件在瀑布的最外层改写 `reasoningEffort`，因此**最终生效**，
-优先级高于模型选择器/设置里的默认 effort。
+DSH 在 `agent/pre-step` 时固定本步的 model selection，再进入 `agent/request`。
+插件按版本双轨工作，判定规则不变：
 
-判定时机：`agent/pre-step`（每步执行前）读取本轮最新用户消息并分类，判定结果
-缓存到当轮结束；`agent/request` 时应用到请求配置。中途转向（steer / 追加消息）
-会触发重新判定。
+- **DSH 0.2.2+**：agent loop 拒绝在 `agent/request` 里改 `reasoningEffort`
+  （报 `proposed reasoning effort ... after step preparation fixed ...`）。
+  插件改在 `agent/inbox/claimed`（claim 发生于 pre-step 读取 selection 之前）
+  判定，并用 `agent.model.select()` 写入 `model/selection`；工具报错后的升级
+  也在 `tools/result` 里同步落盘，供下一步读取。
+- **DSH 0.2.1 及更早**：在 `agent/pre-step` 判定，`agent/request` 瀑布最外层
+  改写 `reasoningEffort`。
+
+两条路径共用同一套分类、限档与通知逻辑；检测方式是
+`typeof agent.model?.select === "function"`。中途转向（steer / 追加消息）会触发
+重新判定。
 
 ## 判定规则（优先级从高到低）
 
